@@ -14,8 +14,8 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.AutomaticGainControl
-import android.media.audiofx.NoiseSuppressor
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.util.Log
 import androidx.annotation.RequiresPermission
@@ -32,6 +32,7 @@ import com.google.firebase.ai.type.GenerativeBackend
 import com.google.firebase.ai.type.InlineData
 import com.google.firebase.ai.type.InlineDataPart
 import com.google.firebase.ai.type.LiveServerContent
+import com.google.firebase.ai.type.LiveServerGoAway
 import com.google.firebase.ai.type.LiveSession
 import com.google.firebase.ai.type.PublicPreviewAPI
 import com.google.firebase.ai.type.ResponseModality
@@ -39,6 +40,7 @@ import com.google.firebase.ai.type.SpeechConfig
 import com.google.firebase.ai.type.Voice
 import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.liveGenerationConfig
+import com.google.firebase.appcheck.FirebaseAppCheck
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -51,13 +53,22 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
+import java.net.ConnectException
+import java.net.SocketException
+import java.net.UnknownHostException
+import java.nio.channels.UnresolvedAddressException
+import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.SSLException
 import kotlin.math.max
 import kotlin.math.sqrt
 
 private const val TAG = "AiMoodViewModel"
-private const val LIVE_MODEL_NAME = "gemini-3.8-live"
+internal const val PRIMARY_LIVE_MODEL_NAME = "gemini-3.1-flash-live-preview"
+internal const val FALLBACK_LIVE_MODEL_NAME = "gemini-2.5-flash-native-audio-preview-12-2025"
 private const val INPUT_SAMPLE_RATE = 16_000
 private const val OUTPUT_SAMPLE_RATE = 24_000
 
@@ -75,6 +86,7 @@ data class AiSupportUiState(
   val isAiSpeaking: Boolean = false,
   val aiSpeakingAmplitude: Float = 0f,
   val errorMessage: String? = null,
+  val needsSettingsForPermission: Boolean = false,
 )
 
 @OptIn(PublicPreviewAPI::class)
@@ -94,8 +106,6 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
   private var audioRecord: AudioRecord? = null
   private var audioTrack: AudioTrack? = null
   private var echoCanceler: AcousticEchoCanceler? = null
-  private var noiseSuppressor: NoiseSuppressor? = null
-  private var gainControl: AutomaticGainControl? = null
 
   private var playbackQueue: Channel<ByteArray>? = null
 
@@ -104,6 +114,8 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
   private var receiveJob: Job? = null
   private var playbackJob: Job? = null
   private var speakingResetJob: Job? = null
+
+  private val handlingStreamFailure = AtomicBoolean(false)
 
   @Volatile private var isAudioWriting: Boolean = false
   @Volatile private var lastPlaybackFinishMs: Long = 0L
@@ -127,6 +139,23 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
       }
   }
 
+  fun onMicPermissionDenied(permanentlyDenied: Boolean) {
+    _uiState.update {
+      it.copy(
+        status = LiveVoiceStatus.ERROR,
+        isAiSpeaking = false,
+        aiSpeakingAmplitude = 0f,
+        needsSettingsForPermission = permanentlyDenied,
+        errorMessage =
+          if (permanentlyDenied) {
+            "Доступ к микрофону запрещён в настройках телефона. Разрешите микрофон в настройках приложения, чтобы говорить с ГАЗелью."
+          } else {
+            "Для разговора с ГАЗелью нужно разрешение на микрофон."
+          },
+      )
+    }
+  }
+
   private fun buildSystemInstructionText(): String =
     """
     Ты — ГАЗель, тёплый, живой и эмпатичный голосовой собеседник в дневнике настроения «toymote» (от Matto Inc.).
@@ -136,6 +165,19 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
     Контекст дневника пользователя: $latestMoodContextSummary
     """.trimIndent()
 
+  private fun isNetworkAvailable(): Boolean {
+    return try {
+      val cm =
+        getApplication<Application>().getSystemService(Context.CONNECTIVITY_SERVICE)
+          as? ConnectivityManager ?: return true
+      val network = cm.activeNetwork ?: return false
+      val caps = cm.getNetworkCapabilities(network) ?: return false
+      caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    } catch (_: Exception) {
+      true
+    }
+  }
+
   @RequiresPermission(Manifest.permission.RECORD_AUDIO)
   fun connectLive() {
     val hasPermission =
@@ -144,10 +186,18 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
         Manifest.permission.RECORD_AUDIO,
       ) == PackageManager.PERMISSION_GRANTED
     if (!hasPermission) {
+      onMicPermissionDenied(permanentlyDenied = false)
+      return
+    }
+
+    if (!isNetworkAvailable()) {
       _uiState.update {
         it.copy(
           status = LiveVoiceStatus.ERROR,
-          errorMessage = "Нужно разрешение на микрофон для разговора с ГАЗелью.",
+          isAiSpeaking = false,
+          aiSpeakingAmplitude = 0f,
+          needsSettingsForPermission = false,
+          errorMessage = "Нет подключения к интернету. Проверьте Wi‑Fi или мобильную связь.",
         )
       }
       return
@@ -159,12 +209,14 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     connectJob?.cancel()
+    handlingStreamFailure.set(false)
     _uiState.update {
       it.copy(
         status = LiveVoiceStatus.CONNECTING,
         isAiSpeaking = false,
         aiSpeakingAmplitude = 0f,
         errorMessage = null,
+        needsSettingsForPermission = false,
       )
     }
 
@@ -173,18 +225,7 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
         try {
           applyAudioRouting(_uiState.value.isSpeakerphoneOn)
 
-          val liveModel =
-            Firebase.ai(backend = GenerativeBackend.googleAI()).liveModel(
-              modelName = LIVE_MODEL_NAME,
-              generationConfig =
-                liveGenerationConfig {
-                  responseModality = ResponseModality.AUDIO
-                  speechConfig = SpeechConfig(voice = Voice("AOEDE"))
-                },
-              systemInstruction = content { text(buildSystemInstructionText()) },
-            )
-
-          val session = withTimeout(30_000L) { liveModel.connect() }
+          val session = connectSessionWithFallback()
           liveSession = session
 
           val queue = Channel<ByteArray>(Channel.UNLIMITED)
@@ -194,7 +235,7 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
           audioRecord = record
           audioTrack = track
 
-          // Re-apply routing after AudioTrack creation so HAL binds output to speaker cleanly
+          // Re-apply routing after AudioTrack/AudioRecord creation so Samsung HAL binds output cleanly
           applyAudioRouting(_uiState.value.isSpeakerphoneOn)
 
           track.play()
@@ -206,6 +247,7 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
             it.copy(
               status = LiveVoiceStatus.CONNECTED,
               errorMessage = null,
+              needsSettingsForPermission = false,
             )
           }
 
@@ -218,7 +260,7 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
               status = LiveVoiceStatus.ERROR,
               isAiSpeaking = false,
               aiSpeakingAmplitude = 0f,
-              errorMessage = "Таймаут подключения. Проверьте интернет и попробуйте снова.",
+              errorMessage = "Сервер не ответил вовремя (таймаут). Проверьте интернет и попробуйте снова.",
             )
           }
         } catch (e: CancellationException) {
@@ -226,17 +268,127 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
           throw e
         } catch (e: Exception) {
           Log.e(TAG, "Live connection failed", e)
+          val detailedError = diagnoseLiveConnectionFailure(e)
           cleanupResources()
           _uiState.update {
             it.copy(
               status = LiveVoiceStatus.ERROR,
               isAiSpeaking = false,
               aiSpeakingAmplitude = 0f,
-              errorMessage = e.localizedMessage ?: "Не удалось подключиться к ГАЗели.",
+              errorMessage = detailedError,
             )
           }
         }
       }
+  }
+
+  private suspend fun diagnoseLiveConnectionFailure(e: Exception): String {
+    val initErr = AppCheckDiagnostics.initError
+    if (!initErr.isNullOrBlank()) {
+      return "Ошибка инициализации App Check ($initErr). Переустановите релизную сборку приложения."
+    }
+
+    val appCheckError = fetchAppCheckErrorIfAny()
+    if (appCheckError != null) {
+      return "Не пройдена проверка App Check / reCAPTCHA ($appCheckError). Проверьте интернет, Google Play Сервисы и точное время на телефоне."
+    }
+
+    val combined = generateSequence<Throwable>(e) { it.cause }.mapNotNull { it.message }.joinToString(" | ").lowercase()
+    if (AppCheckDiagnostics.isDebugBuild &&
+      !AppCheckDiagnostics.hasInjectedDebugToken &&
+      ("unable to connect" in combined || "403" in combined || "handshake" in combined || "closed" in combined)
+    ) {
+      return "Это Debug-сборка без зарегистрированного токена для этого телефона — после передачи APK с другого устройства сервер отклоняет её (403). Установите Release APK или подключите это устройство с debug-токеном."
+    }
+
+    if ("unable to connect to the server" in combined) {
+      return "Не удалось подключиться к серверу Gemini Live. На этом телефоне сервер может быть недоступен без VPN или другого Wi‑Fi (либо используется старая/Debug-сборка без App Check)."
+    }
+
+    return mapLiveErrorToRussian(e)
+  }
+
+  private suspend fun fetchAppCheckErrorIfAny(): String? {
+    return try {
+      withTimeoutOrNull(4_000L) {
+        suspendCancellableCoroutine { cont ->
+          FirebaseAppCheck.getInstance()
+            .getAppCheckToken(false)
+            .addOnSuccessListener { token ->
+              if (cont.isActive) {
+                val empty = token?.token.isNullOrBlank()
+                cont.resume(if (empty) "Пустой токен App Check" else null)
+              }
+            }
+            .addOnFailureListener { err ->
+              if (cont.isActive) {
+                cont.resume(err.localizedMessage ?: err::class.simpleName ?: "AppCheck failure")
+              }
+            }
+        }
+      }
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  private suspend fun connectSessionWithFallback(): LiveSession {
+    val instruction = content { text(buildSystemInstructionText()) }
+    val attempts: List<Pair<String, Boolean>> =
+      listOf(
+        PRIMARY_LIVE_MODEL_NAME to true,
+        FALLBACK_LIVE_MODEL_NAME to true,
+        FALLBACK_LIVE_MODEL_NAME to false,
+      )
+
+    var lastError: Exception? = null
+    for ((index, attempt) in attempts.withIndex()) {
+      val (modelName, useVoiceConfig) = attempt
+      try {
+        val generationConfig =
+          liveGenerationConfig {
+            responseModality = ResponseModality.AUDIO
+            if (useVoiceConfig) {
+              speechConfig = SpeechConfig(voice = Voice("Aoede"))
+            }
+          }
+        val liveModel =
+          Firebase.ai(backend = GenerativeBackend.googleAI()).liveModel(
+            modelName = modelName,
+            generationConfig = generationConfig,
+            systemInstruction = instruction,
+          )
+        return withTimeout(25_000L) { liveModel.connect() }
+      } catch (e: CancellationException) {
+        throw e
+      } catch (e: Exception) {
+        Log.w(TAG, "Live connect attempt #$index ($modelName, voice=$useVoiceConfig) failed", e)
+        lastError = e
+        if (isNonRetryableAuthOrNetworkError(e)) {
+          throw e
+        }
+      }
+    }
+    throw lastError ?: IllegalStateException("Не удалось установить Live-сессию.")
+  }
+
+  private fun isNonRetryableAuthOrNetworkError(e: Throwable): Boolean {
+    var cursor: Throwable? = e
+    while (cursor != null) {
+      if (cursor is UnknownHostException ||
+        cursor is ConnectException ||
+        cursor is UnresolvedAddressException ||
+        cursor is SSLException
+      ) {
+        return true
+      }
+      val msg = cursor.message.orEmpty().lowercase()
+      if ("403" in msg || "appcheck" in msg || "app check" in msg || "attestation" in msg) {
+        return true
+      }
+      cursor = cursor.cause
+    }
+    return false
   }
 
   private fun requestAudioFocus() {
@@ -285,7 +437,6 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
 
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         val devices = audioManager.availableCommunicationDevices
-        // Respect external headset/BT if connected; otherwise switch between speaker and earpiece
         val externalDevice =
           devices.firstOrNull {
             it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
@@ -296,18 +447,26 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
         val targetDevice =
           if (speakerOn) {
             devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+              ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER_SAFE }
           } else {
             externalDevice ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
           }
         if (targetDevice != null) {
-          audioManager.setCommunicationDevice(targetDevice)
+          val ok = audioManager.setCommunicationDevice(targetDevice)
+          if (!ok) {
+            Log.w(TAG, "setCommunicationDevice(${targetDevice.type}) returned false")
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn = speakerOn
+          }
         } else {
           audioManager.clearCommunicationDevice()
+          @Suppress("DEPRECATION")
+          audioManager.isSpeakerphoneOn = speakerOn
         }
+      } else {
+        @Suppress("DEPRECATION")
+        audioManager.isSpeakerphoneOn = speakerOn
       }
-
-      @Suppress("DEPRECATION")
-      audioManager.isSpeakerphoneOn = speakerOn
     } catch (e: Exception) {
       Log.w(TAG, "applyAudioRouting warning", e)
     }
@@ -352,43 +511,21 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
         AudioFormat.CHANNEL_IN_MONO,
         AudioFormat.ENCODING_PCM_16BIT,
       )
-    val recBuf = max(recMin * 2, INPUT_SAMPLE_RATE / 4 * 2)
+    val safeRecMin = if (recMin > 0) recMin else INPUT_SAMPLE_RATE / 5 * 2
+    val recBuf = max(safeRecMin * 2, INPUT_SAMPLE_RATE / 4 * 2)
+
     val record =
-      AudioRecord(
-        MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-        INPUT_SAMPLE_RATE,
-        AudioFormat.CHANNEL_IN_MONO,
-        AudioFormat.ENCODING_PCM_16BIT,
-        recBuf,
-      )
+      buildAudioRecordWithFallback(recBuf)
+        ?: throw IllegalStateException(
+          "Не удалось инициализировать микрофон. Проверьте, не занят ли он другим приложением."
+        )
 
     echoCanceler =
       if (AcousticEchoCanceler.isAvailable()) {
         try {
           AcousticEchoCanceler.create(record.audioSessionId)?.apply { enabled = true }
-        } catch (_: Exception) {
-          null
-        }
-      } else {
-        null
-      }
-
-    noiseSuppressor =
-      if (NoiseSuppressor.isAvailable()) {
-        try {
-          NoiseSuppressor.create(record.audioSessionId)?.apply { enabled = true }
-        } catch (_: Exception) {
-          null
-        }
-      } else {
-        null
-      }
-
-    gainControl =
-      if (AutomaticGainControl.isAvailable()) {
-        try {
-          AutomaticGainControl.create(record.audioSessionId)?.apply { enabled = true }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+          Log.w(TAG, "AcousticEchoCanceler init warning", e)
           null
         }
       } else {
@@ -401,28 +538,99 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
         AudioFormat.CHANNEL_OUT_MONO,
         AudioFormat.ENCODING_PCM_16BIT,
       )
+    val safePlayMin = if (playMin > 0) playMin else OUTPUT_SAMPLE_RATE / 5 * 2
     // Large ~1 second PCM buffer prevents underrun stutters between WebSocket chunks
-    val playBuf = max(playMin * 4, OUTPUT_SAMPLE_RATE * 2)
+    val playBuf = max(safePlayMin * 4, OUTPUT_SAMPLE_RATE * 2)
+
     val track =
-      AudioTrack.Builder()
-        .setAudioAttributes(
-          AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
-        )
-        .setAudioFormat(
-          AudioFormat.Builder()
-            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .setSampleRate(OUTPUT_SAMPLE_RATE)
-            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-            .build()
-        )
-        .setBufferSizeInBytes(playBuf)
-        .setTransferMode(AudioTrack.MODE_STREAM)
-        .build()
+      buildAudioTrackWithFallback(playBuf)
+        ?: run {
+          try {
+            record.release()
+          } catch (_: Exception) {}
+          throw IllegalStateException("Не удалось инициализировать аудиовыход устройства.")
+        }
 
     return record to track
+  }
+
+  @SuppressLint("MissingPermission")
+  private fun buildAudioRecordWithFallback(bufferBytes: Int): AudioRecord? {
+    val sources =
+      listOf(
+        MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+        MediaRecorder.AudioSource.MIC,
+      )
+    for (source in sources) {
+      var candidate: AudioRecord? = null
+      try {
+        candidate =
+          AudioRecord.Builder()
+            .setAudioSource(source)
+            .setAudioFormat(
+              AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(INPUT_SAMPLE_RATE)
+                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                .build()
+            )
+            .setBufferSizeInBytes(bufferBytes)
+            .build()
+        if (candidate.state == AudioRecord.STATE_INITIALIZED) {
+          return candidate
+        }
+        Log.w(TAG, "AudioRecord source $source uninitialized (state=${candidate.state})")
+        candidate.release()
+      } catch (e: Exception) {
+        Log.w(TAG, "AudioRecord source $source failed", e)
+        try {
+          candidate?.release()
+        } catch (_: Exception) {}
+      }
+    }
+    return null
+  }
+
+  private fun buildAudioTrackWithFallback(bufferBytes: Int): AudioTrack? {
+    val usages =
+      listOf(
+        AudioAttributes.USAGE_VOICE_COMMUNICATION,
+        AudioAttributes.USAGE_MEDIA,
+      )
+    for (usage in usages) {
+      var candidate: AudioTrack? = null
+      try {
+        candidate =
+          AudioTrack.Builder()
+            .setAudioAttributes(
+              AudioAttributes.Builder()
+                .setUsage(usage)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            )
+            .setAudioFormat(
+              AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(OUTPUT_SAMPLE_RATE)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build()
+            )
+            .setBufferSizeInBytes(bufferBytes)
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+        if (candidate.state == AudioTrack.STATE_INITIALIZED) {
+          return candidate
+        }
+        Log.w(TAG, "AudioTrack usage $usage uninitialized (state=${candidate.state})")
+        candidate.release()
+      } catch (e: Exception) {
+        Log.w(TAG, "AudioTrack usage $usage failed", e)
+        try {
+          candidate?.release()
+        } catch (_: Exception) {}
+      }
+    }
+    return null
   }
 
   private fun startAudioPipelines(
@@ -440,6 +648,7 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
       viewModelScope.launch(Dispatchers.IO) {
         val chunkBytes = 1024 // ~32ms of 16kHz 16-bit mono PCM
         val buffer = ByteArray(chunkBytes)
+        var consecutiveReadErrors = 0
         try {
           while (isActive && !session.isClosed()) {
             if (_uiState.value.isMicMuted) {
@@ -451,12 +660,13 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
                 record.startRecording()
               } catch (e: Exception) {
                 Log.w(TAG, "AudioRecord startRecording retry warning", e)
-                delay(60L)
+                delay(80L)
                 continue
               }
             }
             val read = record.read(buffer, 0, buffer.size)
             if (read > 0) {
+              consecutiveReadErrors = 0
               // Prevent speakerphone output from echoing back into mic & causing false Gemini VAD interrupts
               val now = System.currentTimeMillis()
               val speakerEchoWindow =
@@ -468,6 +678,14 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
                 val payload = if (read == buffer.size) buffer.copyOf() else buffer.copyOf(read)
                 session.sendAudioRealtime(InlineData(payload, "audio/pcm"))
               }
+            } else if (read < 0) {
+              consecutiveReadErrors++
+              Log.w(TAG, "AudioRecord.read returned error $read (#$consecutiveReadErrors)")
+              if (consecutiveReadErrors >= 8) {
+                reportStreamFailure("Микрофон перестал отвечать (код $read). Попробуйте подключиться снова.")
+                break
+              }
+              delay(40L)
             } else {
               delay(15L)
             }
@@ -476,6 +694,7 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
           throw e
         } catch (e: Exception) {
           Log.e(TAG, "Audio recording stream error", e)
+          reportStreamFailure(mapLiveErrorToRussian(e))
         }
       }
 
@@ -526,6 +745,7 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
           throw e
         } catch (e: Exception) {
           Log.e(TAG, "Audio playback error", e)
+          reportStreamFailure("Ошибка воспроизведения звука: ${e.localizedMessage ?: "неизвестная ошибка"}")
         } finally {
           isAudioWriting = false
         }
@@ -536,52 +756,72 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
       viewModelScope.launch(Dispatchers.IO) {
         try {
           session.receive().collect { message ->
-            if (message is LiveServerContent) {
-              if (message.interrupted) {
-                // Only flush buffered audio on genuine external interrupts
-                if (!_uiState.value.isSpeakerphoneOn || isExternalHeadsetActive()) {
-                  while (queue.tryReceive().isSuccess) {
-                    // drain stale buffered frames
+            when (message) {
+              is LiveServerContent -> {
+                if (message.interrupted) {
+                  // Only flush buffered audio on genuine external interrupts
+                  if (!_uiState.value.isSpeakerphoneOn || isExternalHeadsetActive()) {
+                    while (queue.tryReceive().isSuccess) {
+                      // drain stale buffered frames
+                    }
+                    try {
+                      track.pause()
+                      track.flush()
+                      track.play()
+                    } catch (_: Exception) {}
+                    speakingResetJob?.cancel()
+                    isAudioWriting = false
+                    _uiState.update { it.copy(isAiSpeaking = false, aiSpeakingAmplitude = 0f) }
                   }
-                  try {
-                    track.pause()
-                    track.flush()
-                    track.play()
-                  } catch (_: Exception) {}
-                  speakingResetJob?.cancel()
-                  isAudioWriting = false
-                  _uiState.update { it.copy(isAiSpeaking = false, aiSpeakingAmplitude = 0f) }
                 }
-              }
 
-              val parts = message.content?.parts.orEmpty()
-              for (part in parts) {
-                if (part is InlineDataPart && part.mimeType.startsWith("audio/")) {
-                  val audioBytes = part.inlineData
-                  if (audioBytes.isNotEmpty()) {
-                    queue.trySend(audioBytes)
+                val parts = message.content?.parts.orEmpty()
+                for (part in parts) {
+                  if (part is InlineDataPart && part.mimeType.startsWith("audio/")) {
+                    val audioBytes = part.inlineData
+                    if (audioBytes.isNotEmpty()) {
+                      queue.trySend(audioBytes)
+                    }
                   }
                 }
               }
+              is LiveServerGoAway -> {
+                Log.w(TAG, "LiveServerGoAway received: timeLeft=${message.timeLeft}")
+              }
+              else -> Unit
             }
+          }
+          // Flow completed (server closed WebSocket) while UI still believed it was CONNECTED
+          if (isActive && _uiState.value.status == LiveVoiceStatus.CONNECTED) {
+            reportStreamFailure("Соединение с ГАЗелью завершено сервером. Нажмите «Подключиться», чтобы продолжить.")
           }
         } catch (e: CancellationException) {
           throw e
         } catch (e: Exception) {
           Log.e(TAG, "Live receive stream error", e)
-          if (_uiState.value.status == LiveVoiceStatus.CONNECTED) {
-            cleanupResources()
-            _uiState.update {
-              it.copy(
-                status = LiveVoiceStatus.ERROR,
-                isAiSpeaking = false,
-                aiSpeakingAmplitude = 0f,
-                errorMessage = e.localizedMessage ?: "Соединение с ГАЗелью прервалось.",
-              )
-            }
-          }
+          reportStreamFailure(mapLiveErrorToRussian(e))
         }
       }
+  }
+
+  private fun reportStreamFailure(message: String) {
+    if (_uiState.value.status != LiveVoiceStatus.CONNECTED &&
+      _uiState.value.status != LiveVoiceStatus.CONNECTING
+    ) {
+      return
+    }
+    if (!handlingStreamFailure.compareAndSet(false, true)) return
+    viewModelScope.launch {
+      cleanupResources()
+      _uiState.update {
+        it.copy(
+          status = LiveVoiceStatus.ERROR,
+          isAiSpeaking = false,
+          aiSpeakingAmplitude = 0f,
+          errorMessage = message,
+        )
+      }
+    }
   }
 
   private fun writeChunkToTrack(track: AudioTrack, audioBytes: ByteArray) {
@@ -603,7 +843,10 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
           audioBytes.size - offset,
           AudioTrack.WRITE_BLOCKING,
         )
-      if (written <= 0) break
+      if (written < 0) {
+        throw IllegalStateException("AudioTrack.write failed with code $written")
+      }
+      if (written == 0) break
       offset += written
     }
     lastPlaybackFinishMs = System.currentTimeMillis()
@@ -650,6 +893,7 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
 
   fun disconnectLive() {
     connectJob?.cancel()
+    handlingStreamFailure.set(false)
     viewModelScope.launch {
       cleanupResources()
       _uiState.update {
@@ -658,6 +902,7 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
           isAiSpeaking = false,
           aiSpeakingAmplitude = 0f,
           errorMessage = null,
+          needsSettingsForPermission = false,
         )
       }
     }
@@ -681,16 +926,6 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
       echoCanceler?.release()
     } catch (_: Exception) {}
     echoCanceler = null
-
-    try {
-      noiseSuppressor?.release()
-    } catch (_: Exception) {}
-    noiseSuppressor = null
-
-    try {
-      gainControl?.release()
-    } catch (_: Exception) {}
-    gainControl = null
 
     val record = audioRecord
     audioRecord = null
@@ -763,23 +998,50 @@ class AiMoodViewModel(application: Application) : AndroidViewModel(application) 
       echoCanceler?.release()
     } catch (_: Exception) {}
     try {
-      noiseSuppressor?.release()
-    } catch (_: Exception) {}
-    try {
-      gainControl?.release()
-    } catch (_: Exception) {}
-    try {
       audioRecord?.release()
     } catch (_: Exception) {}
     try {
       audioTrack?.release()
     } catch (_: Exception) {}
     echoCanceler = null
-    noiseSuppressor = null
-    gainControl = null
     audioRecord = null
     audioTrack = null
     liveSession = null
     restoreAudioRouting()
+  }
+}
+
+internal fun mapLiveErrorToRussian(e: Throwable): String {
+  val chain = generateSequence(e) { it.cause }.toList()
+  val combinedMsg = chain.mapNotNull { it.message }.joinToString(" | ")
+  val lower = combinedMsg.lowercase()
+
+  return when {
+    chain.any {
+      it is UnknownHostException ||
+        it is ConnectException ||
+        it is SocketException ||
+        it is UnresolvedAddressException ||
+        it is SSLException
+    } ->
+      "Нет стабильного соединения с сервером. Проверьте интернет, Wi‑Fi или VPN и попробуйте снова."
+
+    "403" in lower || "appcheck" in lower || "app check" in lower || "attestation" in lower ->
+      "Сервер отклонил проверку приложения (App Check / 403). На физическом устройстве нужна релизная сборка с reCAPTCHA либо зарегистрированный debug-токен."
+
+    "429" in lower || "quota" in lower || "resource_exhausted" in lower ->
+      "Превышен лимит запросов к серверу. Попробуйте подключиться через пару минут."
+
+    "404" in lower || "not found" in lower || "unsupported" in lower || "invalid argument" in lower ->
+      "Модель голоса отклонила подключение (${combinedMsg.take(120)})."
+
+    "микрофон" in lower || "audiorecord" in lower ->
+      combinedMsg.ifBlank { "Не удалось запустить микрофон на устройстве." }
+
+    combinedMsg.isNotBlank() ->
+      "Не удалось подключиться к ГАЗели: ${combinedMsg.take(160)}"
+
+    else ->
+      "Не удалось подключиться к ГАЗели (${e::class.simpleName ?: "ошибка"})."
   }
 }

@@ -313,6 +313,9 @@ fun ToymoteApp(
                   onDisconnect = { aiViewModel.disconnectLive() },
                   onToggleMute = { aiViewModel.toggleMicMute() },
                   onToggleSpeakerphone = { aiViewModel.toggleSpeakerphone() },
+                  onMicPermissionDenied = { permanentlyDenied ->
+                    aiViewModel.onMicPermissionDenied(permanentlyDenied)
+                  },
                 )
               }
 

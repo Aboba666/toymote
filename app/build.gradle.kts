@@ -13,11 +13,14 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    minSdk = 24    applicationId = "com.matto.toymote"
-
+    applicationId = "com.matto.toymote"
+    minSdk = 24
     targetSdk = 36
     versionCode = 1
     versionName = "SHANEL №1"
+
+    testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+  }
 
   // Do not remove or modify these signingConfigs. They are necessary for building, installing,
   // and updating Android apps in AI Studio.

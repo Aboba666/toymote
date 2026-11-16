@@ -16,8 +16,17 @@ private const val DEBUG_STORE_PREFIX = "com.google.firebase.appcheck.debug.store
 private const val DEBUG_SECRET_KEY = "com.google.firebase.appcheck.debug.DEBUG_SECRET"
 private const val RECAPTCHA_SITE_KEY_RES = "recaptcha_site_key"
 
+object AppCheckDiagnostics {
+  @Volatile var isDebugBuild: Boolean = BuildConfig.DEBUG
+  @Volatile var hasInjectedDebugToken: Boolean = false
+  @Volatile var initError: String? = null
+}
+
 fun configureAppCheck(context: Context, intent: Intent?) {
   try {
+    AppCheckDiagnostics.isDebugBuild = BuildConfig.DEBUG
+    AppCheckDiagnostics.initError = null
+
     if (FirebaseApp.getApps(context).isEmpty()) {
       FirebaseApp.initializeApp(context)
     }
@@ -33,8 +42,10 @@ fun configureAppCheck(context: Context, intent: Intent?) {
             Context.MODE_PRIVATE,
           )
         prefs.edit().putString(DEBUG_SECRET_KEY, debugToken).commit()
+        AppCheckDiagnostics.hasInjectedDebugToken = true
         Log.d(TAG, "App Check debug secret configured successfully.")
       } else {
+        AppCheckDiagnostics.hasInjectedDebugToken = false
         Log.w(TAG, "No debug token found in Intent extra.")
       }
 
@@ -53,13 +64,16 @@ fun configureAppCheck(context: Context, intent: Intent?) {
             )
           Log.d(TAG, "RecaptchaAppCheckProviderFactory installed.")
         } else {
+          AppCheckDiagnostics.initError = "recaptcha_site_key пустой"
           Log.e(TAG, "recaptcha_site_key resource string is blank.")
         }
       } else {
+        AppCheckDiagnostics.initError = "recaptcha_site_key не найден"
         Log.e(TAG, "recaptcha_site_key string resource not found in package.")
       }
     }
   } catch (e: Exception) {
+    AppCheckDiagnostics.initError = e.localizedMessage ?: e::class.simpleName
     Log.e(TAG, "Failed to initialize Firebase App Check", e)
   }
 }

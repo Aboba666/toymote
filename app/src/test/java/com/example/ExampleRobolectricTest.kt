@@ -1,13 +1,19 @@
 package com.example
 
+import android.app.Application
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import com.example.ai.AiMoodViewModel
 import com.example.ai.AiSupportUiState
+import com.example.ai.FALLBACK_LIVE_MODEL_NAME
 import com.example.ai.LiveVoiceStatus
+import com.example.ai.PRIMARY_LIVE_MODEL_NAME
+import com.example.ai.mapLiveErrorToRussian
 import com.example.data.MoodEntryEntity
 import com.example.data.UserSettings
 import com.example.domain.ToymoteDate
 import com.example.widgets.ToymoteWidgetRenderer
+import java.net.UnknownHostException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -29,7 +35,26 @@ class ExampleRobolectricTest {
     val defaultAiState = AiSupportUiState()
     assertEquals(LiveVoiceStatus.DISCONNECTED, defaultAiState.status)
     assertTrue(defaultAiState.isSpeakerphoneOn)
+    assertFalse(defaultAiState.needsSettingsForPermission)
     assertFalse(UserSettings().widgetPromptShown)
+  }
+
+  @Test
+  fun `gazelle uses supported live models and maps errors cleanly`() {
+    assertEquals("gemini-3.1-flash-live-preview", PRIMARY_LIVE_MODEL_NAME)
+    assertEquals("gemini-2.5-flash-native-audio-preview-12-2025", FALLBACK_LIVE_MODEL_NAME)
+
+    val netErr = mapLiveErrorToRussian(UnknownHostException("generativelanguage.googleapis.com"))
+    assertTrue(netErr.contains("интернет"))
+
+    val appCheckErr = mapLiveErrorToRussian(RuntimeException("HTTP 403 AppCheck token rejected"))
+    assertTrue(appCheckErr.contains("App Check") && appCheckErr.contains("403"))
+
+    val app = ApplicationProvider.getApplicationContext<Application>()
+    val vm = AiMoodViewModel(app)
+    vm.onMicPermissionDenied(permanentlyDenied = true)
+    assertEquals(LiveVoiceStatus.ERROR, vm.uiState.value.status)
+    assertTrue(vm.uiState.value.needsSettingsForPermission)
   }
 
   @Test

@@ -1,10 +1,15 @@
 package com.example.ui.screens
 
 import android.Manifest
+import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.core.app.ActivityCompat
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -89,6 +94,7 @@ fun AiSupportScreen(
   onDisconnect: () -> Unit,
   onToggleMute: () -> Unit,
   onToggleSpeakerphone: () -> Unit,
+  onMicPermissionDenied: (permanentlyDenied: Boolean) -> Unit,
   modifier: Modifier = Modifier,
 ) {
   val context = LocalContext.current
@@ -97,6 +103,15 @@ fun AiSupportScreen(
     rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
       if (granted) {
         onConnect()
+      } else {
+        val activity = context as? Activity
+        val showRationale =
+          activity != null &&
+            ActivityCompat.shouldShowRequestPermissionRationale(
+              activity,
+              Manifest.permission.RECORD_AUDIO,
+            )
+        onMicPermissionDenied(!showRationale)
       }
     }
 
@@ -228,13 +243,37 @@ fun AiSupportScreen(
             shape = MaterialTheme.shapes.medium,
             modifier = Modifier.fillMaxWidth(),
           ) {
-            Text(
-              text = aiState.errorMessage.orEmpty(),
-              style = MaterialTheme.typography.bodySmall,
-              color = MaterialTheme.colorScheme.onErrorContainer,
-              textAlign = TextAlign.Center,
-              modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-            )
+            Column(
+              modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+              horizontalAlignment = Alignment.CenterHorizontally,
+              verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+              Text(
+                text = aiState.errorMessage.orEmpty(),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                textAlign = TextAlign.Center,
+              )
+              if (aiState.needsSettingsForPermission) {
+                FilledTonalButton(
+                  onClick = {
+                    val intent =
+                      Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.fromParts("package", context.packageName, null)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      }
+                    context.startActivity(intent)
+                  },
+                  modifier = Modifier.height(48.dp).testTag("gazelle_open_settings_button"),
+                ) {
+                  Text(
+                    text = "Открыть настройки",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                  )
+                }
+              }
+            }
           }
         }
       }

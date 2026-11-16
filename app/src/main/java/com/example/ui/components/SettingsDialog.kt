@@ -44,6 +44,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.example.BuildConfig
 import com.example.R
 import com.example.data.UserSettings
 import com.example.ui.components.MattoCompanyLogo
@@ -197,7 +198,7 @@ fun SettingsDialog(
         Spacer(modifier = Modifier.height(4.dp))
         MattoCompanyLogo(compact = true)
         Text(
-          text = stringResource(id = R.string.brand_signature),
+          text = "${stringResource(id = R.string.brand_signature)} • Версия ${BuildConfig.VERSION_NAME}",
           style = MaterialTheme.typography.labelMedium,
           color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
