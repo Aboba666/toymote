@@ -1,0 +1,6 @@
+{
+  "name": "toymote",
+  "description": "Личный офлайн-дневник эмоций в стиле Roblox от Matto Inc. с календарём настроения, ударными сериями, статистикой и рекомендациями.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

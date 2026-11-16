@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">toymote</string>
+    <string name="brand_signature">toymote by Matto Inc.</string>
+    <string name="nav_calendar">Календарь</string>
+    <string name="nav_stats">Статистика</string>
+    <string name="nav_advice">Советы</string>
+    <string name="nav_ai">ГАЗель</string>
+    <string name="fab_add_mood">Добавить эмоцию</string>
+    <string name="streak_title">Ударная серия</string>
+    <string name="notification_channel_name">Вечерние напоминания</string>
+    <string name="notification_channel_desc">Ежедневное напоминание отметить настроение в дневнике toymote</string>
+    <string name="notification_title">toymote</string>
+    <string name="notification_body">Какое у тебя настроение сегодня? Как ты себя чувствуешь?</string>
+    <string name="widget_streak_name">toymote: Ударная серия</string>
+    <string name="widget_streak_desc">Счётчик ударной серии с огоньком и статусом сегодняшней отметки</string>
+    <string name="widget_calendar_name">toymote: Календарь эмоций</string>
+    <string name="widget_calendar_desc">Календарь месяца или недели с лицами вашего настроения</string>
+    <string name="widget_combo_name">toymote: Серия + Календарь</string>
+    <string name="widget_combo_desc">Комбинированный виджет с ударной серией и календарём эмоций</string>
+</resources>
